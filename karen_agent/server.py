@@ -62,6 +62,13 @@ def refresh_once() -> None:
         if not frames:
             raise RuntimeError("No price data downloaded.")
 
+        # Refuse to trade on old data: the newest candle must be under 3 hours old.
+        newest = max(f["timestamp"].max() for f in frames.values())
+        age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(
+            str(newest)).replace(tzinfo=timezone.utc)).total_seconds() / 3600
+        if age_h > 3:
+            raise RuntimeError(f"Price data is stale ({age_h:.1f} hours old)")
+
         broker = run_portfolio(frames)
         sells = [t for t in broker.trades if t[1].startswith("SELL")]
         wins = [t for t in sells if t[3] > 0]
@@ -143,6 +150,7 @@ def authorised(header: str | None) -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def _deny(self) -> None:
+        time.sleep(1)  # slow down password guessing
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Karen"')
         self.end_headers()

@@ -22,7 +22,8 @@ ASSET_PAIRS_API = "https://api.kraken.com/0/public/AssetPairs"
 # Coins to download, matched against Kraken's own list of pairs (e.g. "SOL/GBP").
 COINS = ["SOL", "LINK", "GRT", "POPCAT", "WIF"]
 INTERVAL_MIN = 60          # 1-hour candles
-MAX_PAGES = 40             # about 720 candles per page; caps the history downloaded
+START_DAYS = 90            # history to download, counted back from now
+MAX_PAGES = 40             # about 720 candles per page; hard cap on requests
 OUT_DIR = "data"
 
 
@@ -65,21 +66,31 @@ def fetch_page(pair: str, since: int | None) -> tuple[list, int | None]:
 
 
 def fetch_pair(pair: str) -> list:
-    rows, since = [], None
+    """Download START_DAYS of hourly candles, oldest first, with no duplicates.
+
+    Starts from a fixed point in time so history doesn't depend on Kraken's default.
+    Leaves out the candle that is still forming, since its close is not final.
+    """
+    now = int(time.time())
+    rows = []
+    since = now - START_DAYS * 86400
     for _ in range(MAX_PAGES):
         page, last = fetch_page(pair, since)
         if not page:
             break
         rows.extend(page)
-        if since == last:
+        if last == since:
             break
         since = last
         time.sleep(1.1)  # stay within Kraken's public rate limit
-    # Remove duplicates and sort oldest first.
+
     seen, clean = set(), []
     for r in sorted(rows, key=lambda r: r[0]):
-        if r[0] not in seen:
-            seen.add(r[0])
+        if r[0] in seen:
+            continue
+        seen.add(r[0])
+        # Keep only candles that have fully closed.
+        if int(r[0]) + INTERVAL_MIN * 60 <= now:
             clean.append(r)
     return clean
 
