@@ -1,8 +1,10 @@
-"""Karen hosted service (paper trading only).
+"""Karen hosted service (simulation only).
 
 What it does:
   - Every hour, downloads the latest Kraken public candles for the watchlist.
-  - Runs the strategy on a shared paper portfolio.
+  - Re-runs the strategy over the last 90 days of those prices on a shared
+    simulated portfolio. This is a rolling simulation, not a forward test:
+    nothing is carried over between runs.
   - Serves a password-protected page and JSON with the latest results.
 
 What it never does:
@@ -33,7 +35,16 @@ import fetch_kraken
 from agent import load_candles, run_portfolio
 
 DATA_DIR = fetch_kraken.OUT_DIR
-REFRESH_SECONDS = int(os.environ.get("REFRESH_MINUTES", "60")) * 60
+def _refresh_minutes() -> int:
+    """Read REFRESH_MINUTES, falling back to 60 if it's missing or not a positive number."""
+    try:
+        minutes = int(os.environ.get("REFRESH_MINUTES", "60"))
+        return minutes if minutes > 0 else 60
+    except ValueError:
+        return 60
+
+
+REFRESH_SECONDS = _refresh_minutes() * 60
 
 state = {
     "updated": None,
@@ -78,7 +89,7 @@ def refresh_once() -> None:
             "win_rate_pct": round(len(wins) / len(sells) * 100, 1) if sells else None,
             "return_pct": round((broker.cash - 1000.0) / 1000.0 * 100, 2),
             "ending_cash_gbp": round(broker.cash, 2),
-            "mode": "PAPER ONLY",
+            "mode": "SIMULATION ONLY (last 90 days, re-run hourly)",
         }
         recent = [
             {"time": str(t[0]), "action": t[1], "price": round(float(t[2]), 6), "amount": round(float(t[3]), 2)}
@@ -121,14 +132,14 @@ def page_html() -> str:
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:6px;text-align:left;font-size:14px}}
 .warn{{background:#fff3cd;padding:8px;border-radius:6px}}</style></head><body>
 <h2>Karen agent</h2>
-<p class="warn"><b>PAPER TRADING ONLY.</b> No real orders are placed.</p>
+<p class="warn"><b>SIMULATION ONLY.</b> Re-runs the strategy on the last 90 days of prices every hour. No orders are placed, and nothing carries over between runs.</p>
 <p>Last updated: {html.escape(str(s['updated']))} · Status: {html.escape(str(s['status']))}</p>
 {'<p>Error: ' + html.escape(str(s['error'])) + '</p>' if s['error'] else ''}
 <ul>
 <li>Coins: {html.escape(', '.join(summ.get('coins', [])) or 'n/a')}</li>
 <li>Closed trades: {summ.get('closed_trades', 'n/a')}</li>
 <li>Win rate: {summ.get('win_rate_pct', 'n/a')}%</li>
-<li>Return: {summ.get('return_pct', 'n/a')}% on £1000 (paper)</li>
+<li>Return: {summ.get('return_pct', 'n/a')}% on £1000 (simulated, last 90 days)</li>
 </ul>
 <h3>Recent trades</h3>
 <table><tr><th>Time (UTC)</th><th>Action</th><th>Price</th><th>Amount (£)</th></tr>{rows}</table>

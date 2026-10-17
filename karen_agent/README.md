@@ -27,7 +27,7 @@ python agent.py backtest-all data/  # watchlist backtest on one shared pot
 `/` shows the page and `/api/report` returns JSON. Both need the login.
 
 ## Known limits
-- **Paper only.** The service never places orders.
+- **Simulation only.** The hosted service never places orders. It re-runs the strategy on the last 90 days of prices every hour, starting fresh each time. That is a rolling backtest, not a forward paper trade. A true paper trade needs a persistent record of simulated orders, which isn't built yet.
 - **Data age.** If the newest candle is over 3 hours old, the run is marked as an error and no new results are shown.
 - **Costs.** Fees are set to Kraken Pro Tier 1 taker (0.80% per side), the rate for market orders, from Kraken's fee page. Slippage (0.2%) is an assumption. Fees fall with 30-day volume, so check your tier in your account and update `config.py`.
 - **Backtests are not proof.** Results cover 90 days of history and one strategy. Judge the paper run over several weeks before any live decision.
