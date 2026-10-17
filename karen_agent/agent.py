@@ -213,10 +213,7 @@ def main() -> None:
             broker = run(load_candles(path))
             report("Paper trading (live is off)", broker)
             return
-        raise SystemExit(
-            "Live mode is ON, but no exchange connector is wired in yet. "
-            "Tell me which exchange your key is from so I can connect it."
-        )
+        raise SystemExit("Live trading runs from live.py (Kraken). Use: python live.py check, then python live.py")
 
     print(__doc__)
 
