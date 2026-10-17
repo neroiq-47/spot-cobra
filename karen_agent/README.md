@@ -1,7 +1,8 @@
-# Karen spot agent (paper trading)
+# Karen spot agent
 
 Mean-reversion spot strategy for SOL, LINK, GRT, POPCAT and WIF on Kraken GBP pairs.
-Live trading is **off** and has no code path in the hosted service.
+Live trading is **off** by default. The hosted page (`server.py`) is simulation-only;
+real orders can only come from `live.py`, and only when both switches are ON.
 
 ## Files
 - `strategy.py`: the buy/sell rules (Bollinger Bands, RSI, 200-hour trend filter, stop loss).
@@ -10,6 +11,9 @@ Live trading is **off** and has no code path in the hosted service.
 - `fetch_kraken.py`: downloads public hourly candles from Kraken. No login, no API key.
 - `feed.py`: price source interface. The live connector is not connected.
 - `server.py`: hosted, login-protected paper-trading page for Railway.
+- `kraken_client.py`: signed Kraken private API (balance, market orders, order status).
+- `live.py`: the live trader. Validate mode (default) or real orders.
+- `test_live.py`: offline tests for the live path (`python -m unittest test_live`).
 
 ## Local use
 ```
@@ -26,10 +30,30 @@ python agent.py backtest-all data/  # watchlist backtest on one shared pot
 
 `/` shows the page and `/api/report` returns JSON. Both need the login.
 
+## Live trading (Kraken)
+Two modes, picked by the switches:
+- **Validate (default).** Each order goes to Kraken with `validate=true`: Kraken checks it and places nothing. Fills are simulated at the live bid/ask with fees, and saved to `state/positions_validate.json`. This is the forward paper trade.
+- **Live.** Real market orders. Needs `LIVE_TRADING = True` in `config.py` (a code change you commit) **and** `KAREN_LIVE_TRADING=ON` in the environment.
+
+Steps:
+1. On Kraken, create an API key with only: *Funds: Query*, *Orders and trades: Query open orders & trades*, *Query closed orders & trades*, *Create & modify orders*. **Never Withdraw.** Restrict it to your server's IP if you can.
+2. Set `KRAKEN_API_KEY` and `KRAKEN_API_SECRET` as environment variables (Railway Variables, never in the repo).
+3. `python live.py check`: checks keys, permissions, pairs, GBP balance and Kraken's minimum order size, and validates one buy per coin. Places nothing. Must say `READY`.
+4. `python live.py`: runs in validate mode. Leave it for several weeks and compare with the backtest.
+5. Only then, to go live: set `LIVE_TRADING = True` in `config.py`, set `KAREN_LIVE_TRADING=ON`, run `check` again (it should say `LIVE`), then start `live.py`. To stop real orders, set `KAREN_LIVE_TRADING=OFF` and restart.
+
+On Railway, run it as a **second service** from the same repo (Root Directory `karen_agent`, Start Command `python live.py`), with a **volume** mounted at `/data` and `KAREN_STATE_DIR=/data`. Without a volume, saved positions are lost on every redeploy. Railway volumes are owned by root: if the state file can't be written, set `RAILWAY_RUN_UID=0` on that service. Run only one copy of `live.py` per API key.
+
+What `live.py` does each minute: checks open positions against the live bid for the 5% stop loss. After each hourly candle closes, it applies the same buy/sell rules as the backtest.
+
+Safety limits (in `config.py`): £20 per buy, 3 coins at once, no new buys after £30 realised loss in a UTC day or £60 in total. It only sells the amount it bought, never your other holdings of the same coin. On startup in live mode it compares saved positions with your Kraken balances. If an order's outcome is unclear (timeout, Kraken service error, partial fill) it **halts**: check Kraken, fix `positions_live.json` (clear `halted`), then restart.
+
 ## Known limits
 - **Simulation only.** The hosted service never places orders. It re-runs the strategy on the last 90 days of prices every hour, starting fresh each time. That is a rolling backtest, not a forward paper trade. A true paper trade needs a persistent record of simulated orders, which isn't built yet.
 - **Data age.** If the newest candle is over 3 hours old, the run is marked as an error and no new results are shown.
 - **Costs.** Fees are set to Kraken Pro Tier 1 taker (0.80% per side), the rate for market orders, from Kraken's fee page. Slippage (0.2%) is an assumption. Fees fall with 30-day volume, so check your tier in your account and update `config.py`.
 - **Backtests are not proof.** Results cover 90 days of history and one strategy. Judge the paper run over several weeks before any live decision.
-- **No live feed in the hosted service.** `feed.py` is a placeholder.
+- **No live feed in the hosted service.** `feed.py` is a placeholder; `live.py` reads Kraken directly.
+- **Live path is tested offline only.** `test_live.py` uses a fake Kraken and checks the request signing against Kraken's published example. Run `python live.py check` with your key before trusting it.
+- **Market orders, hourly rules.** Stops are checked once a minute, not placed on the exchange, so a fast drop can fill well below 5%. If `live.py` is down, nothing protects open positions.
 - **Login is basic auth.** Railway serves HTTPS, but use a strong password and rotate it if shared.
