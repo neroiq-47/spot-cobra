@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+.env
+.git
+README.md
+railway.json

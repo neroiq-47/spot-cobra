@@ -23,8 +23,10 @@ MAX_TRADE_GBP = 20.0        # largest single order
 MAX_DAILY_LOSS_GBP = 30.0   # stop new buys for the day if losses reach this
 MAX_OPEN_POSITIONS = 3      # most coins held at once across the watchlist
 
-# Cost assumptions. Replace with your exchange's real figures once known.
-FEE = 0.006       # 0.6% per side
+# Cost assumptions. Source: Kraken fee schedule (Pro, Tier 1: 0.40% maker, 0.80% taker).
+# Karen places market orders (takes liquidity), so the taker rate is used: a conservative cost.
+# Fees drop with 30-day volume. Check your own tier in your Kraken Pro account.
+FEE = 0.008       # 0.80% per side (Kraken Pro Tier 1, taker)
 SLIPPAGE = 0.002  # 0.2% worse fill on each trade
 
 

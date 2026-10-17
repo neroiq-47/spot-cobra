@@ -20,7 +20,7 @@ python agent.py backtest-all data/  # watchlist backtest on one shared pot
 
 ## Deploy on Railway
 1. New project, connect this repo.
-2. Service settings: set **Root Directory** to `karen_agent` (the Dockerfile lives there).
+2. Service settings: set **Root Directory** to `karen_agent`. The Dockerfile, `railway.json` and `.dockerignore` all live there, and Railway builds with the Dockerfile.
 3. Variables: set `KAREN_USER` and `KAREN_PASSWORD` (long random password). Do not add the Kraken API key.
 4. Deploy, open the URL, log in.
 
@@ -29,7 +29,7 @@ python agent.py backtest-all data/  # watchlist backtest on one shared pot
 ## Known limits
 - **Paper only.** The service never places orders.
 - **Data age.** If the newest candle is over 3 hours old, the run is marked as an error and no new results are shown.
-- **Costs are assumptions.** Fees (0.6% per side) and slippage (0.2%) are in `config.py`. Replace them with your Kraken Pro figures.
+- **Costs.** Fees are set to Kraken Pro Tier 1 taker (0.80% per side), the rate for market orders, from Kraken's fee page. Slippage (0.2%) is an assumption. Fees fall with 30-day volume, so check your tier in your account and update `config.py`.
 - **Backtests are not proof.** Results cover 90 days of history and one strategy. Judge the paper run over several weeks before any live decision.
 - **No live feed in the hosted service.** `feed.py` is a placeholder.
 - **Login is basic auth.** Railway serves HTTPS, but use a strong password and rotate it if shared.
