@@ -25,10 +25,15 @@ python agent.py backtest-all data/  # watchlist backtest on one shared pot
 ## Deploy on Railway
 1. New project, connect this repo.
 2. Service settings: set **Root Directory** to `karen_agent`. The Dockerfile, `railway.json` and `.dockerignore` all live there, and Railway builds with the Dockerfile.
-3. Variables: set `KAREN_USER` and `KAREN_PASSWORD` (long random password). Do not add the Kraken API key.
+3. Variables: set `KAREN_USER` and `KAREN_PASSWORD` (long random password).
 4. Deploy, open the URL, log in.
 
 `/` shows the page and `/api/report` returns JSON. Both need the login.
+
+To run the trader in the same service (one service, one volume, page and trader together):
+5. Add a **volume** mounted at `/data`, and set `KAREN_STATE_DIR=/data`. Without it, saved positions are lost on every redeploy. Railway volumes are owned by root: if the state file can't be written, set `RAILWAY_RUN_UID=0`.
+6. Set `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` and `KAREN_RUN_TRADER=ON`. Redeploy.
+7. The page's Live trader section shows `trader running` in VALIDATE mode. It stays in validate mode (no orders placed) until both live switches are ON.
 
 ## Live trading (Kraken)
 Two modes, picked by the switches:
@@ -42,7 +47,7 @@ Steps:
 4. `python live.py`: runs in validate mode. Leave it for several weeks and compare with the backtest.
 5. Only then, to go live: set `LIVE_TRADING = True` in `config.py`, set `KAREN_LIVE_TRADING=ON`, run `check` again (it should say `LIVE`), then start `live.py`. To stop real orders, set `KAREN_LIVE_TRADING=OFF` and restart.
 
-On Railway, run it as a **second service** from the same repo (Root Directory `karen_agent`, Start Command `python live.py`), with a **volume** mounted at `/data` and `KAREN_STATE_DIR=/data`. Without a volume, saved positions are lost on every redeploy. Railway volumes are owned by root: if the state file can't be written, set `RAILWAY_RUN_UID=0` on that service. Run only one copy of `live.py` per API key.
+On Railway, run it inside the dashboard service with `KAREN_RUN_TRADER=ON` (steps 5–7 above), so the page shows it. Run only **one** trader per API key: don't also start `python live.py` elsewhere with the same key. If the trader halts, the page says why; fix it, clear `halted` in the state file, and restart the service.
 
 What `live.py` does each minute: checks open positions against the live bid for the 5% stop loss. After each hourly candle closes, it applies the same buy/sell rules as the backtest.
 

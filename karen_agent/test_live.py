@@ -5,6 +5,7 @@ Run: python -m unittest test_live -v
 
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -213,6 +214,48 @@ class TraderTest(unittest.TestCase):
         t = self.trader(True)
         t.step()
         self.assertEqual(self.client.orders, [])
+
+
+class ServerTraderTest(unittest.TestCase):
+    """The trader running inside server.py (KAREN_RUN_TRADER=ON)."""
+
+    def setUp(self):
+        import server
+        self.server = server
+        self.cwd = os.getcwd()
+        os.chdir(tempfile.mkdtemp())       # live.py saves to ./state by default
+        self.addCleanup(os.chdir, self.cwd)
+        self.client = FakeClient()
+        series = dip_series()
+        for target, value in (
+            ("kraken_client.KrakenClient", lambda: self.client),
+            # Candles end at the last closed hour of the real clock, which the trader uses here.
+            ("live.fetch_kraken.fetch_page",
+             lambda pair, since: (candles(series, int(time.time()) // HOUR * HOUR - HOUR), 0)),
+        ):
+            p = mock.patch(target, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_runs_in_validate_mode_and_dashboard_shows_it(self):
+        def one_step_then_halt(trader):
+            trader.step()
+            self.assertEqual(self.server.trader_status["state"], "running")
+            trader.halt("test stop")
+        with mock.patch("live.LiveTrader.run_forever", one_step_then_halt):
+            self.server.trader_loop()
+        self.assertEqual(self.server.trader_status["state"], "halted")
+        self.assertTrue(all(validate for _, _, validate in self.client.orders))
+        page = self.server.page_html()
+        self.assertIn("VALIDATE: orders checked", page)
+        self.assertIn("SOL", page)
+        self.assertIn("test stop", page)
+
+    def test_missing_keys_reported(self):
+        self.client.has_keys = lambda: False
+        self.server.trader_loop()
+        self.assertEqual(self.server.trader_status["state"], "error")
+        self.assertIn("not set", self.server.page_html())
 
 
 if __name__ == "__main__":

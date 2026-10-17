@@ -1,4 +1,4 @@
-"""Karen hosted service (dashboard; places no orders).
+"""Karen hosted service: dashboard, plus the live trader when KAREN_RUN_TRADER=ON.
 
 What it does:
   - Every hour, downloads the latest Kraken public candles for the watchlist.
@@ -8,9 +8,12 @@ What it does:
   - Shows the live trader's saved state (live.py), read-only, if its state
     file is in KAREN_STATE_DIR: mode, halt status, open positions and P&L.
   - Serves a password-protected HTML dashboard and JSON with the latest results.
+  - If KAREN_RUN_TRADER=ON, also runs the live.py trading loop in this process,
+    so one Railway service and one volume hold both the page and the trader.
+    The trader is in validate mode (no orders placed) unless both live switches are ON.
 
 What it never does:
-  - Place orders. Only live.py can trade, and only when both switches are ON.
+  - Place orders from the web page itself. Pages and /api/report are read-only.
   - Show or log the Kraken API key (it isn't needed: public prices only).
 
 Required environment variables (set in Railway, never in code):
@@ -20,6 +23,7 @@ Optional:
   PORT             set automatically by Railway
   REFRESH_MINUTES  how often to refresh, default 60
   KAREN_STATE_DIR  folder holding live.py's state files, default "state"
+  KAREN_RUN_TRADER ON to run the trader here (needs KRAKEN_API_KEY / KRAKEN_API_SECRET)
 """
 
 import base64
@@ -51,6 +55,11 @@ def _refresh_minutes() -> int:
 
 
 REFRESH_SECONDS = _refresh_minutes() * 60
+RUN_TRADER = os.environ.get("KAREN_RUN_TRADER", "OFF").upper() == "ON"
+TRADER_RETRY_SECONDS = 60
+
+# What the in-process trader is doing, for the dashboard.
+trader_status = {"state": "off" if not RUN_TRADER else "starting", "detail": None}
 
 state = {
     "updated": None,
@@ -140,6 +149,33 @@ def refresh_once() -> None:
         traceback.print_exc()
 
 
+def trader_loop() -> None:
+    """Run the live.py loop in this process. Retries start-up (e.g. Kraken unreachable at boot)."""
+    import live
+    from kraken_client import KrakenClient
+
+    while True:
+        try:
+            client = KrakenClient()
+            if not client.has_keys():
+                trader_status.update(state="error", detail="KRAKEN_API_KEY / KRAKEN_API_SECRET are not set")
+                return
+            trader = live.LiveTrader(client, live=config.live_trading_enabled())
+            trader.load_pairs()
+            if not trader.pairs:
+                raise RuntimeError("No tradable pairs found")
+            if trader.live:
+                trader.reconcile(client.balance())
+            trader_status.update(state="running", detail="LIVE" if trader.live else "VALIDATE")
+            trader.run_forever()   # returns only when halted
+            trader_status.update(state="halted", detail=trader.state["halted"])
+            return
+        except Exception as e:
+            trader_status.update(state="error", detail=f"start-up failed, retrying: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            time.sleep(TRADER_RETRY_SECONDS)
+
+
 def refresh_loop() -> None:
     while True:
         refresh_once()
@@ -205,12 +241,24 @@ def card(label: str, value: str, sub: str = "") -> str:
             f'<div class="value">{value}</div><div class="sub">{html.escape(sub)}</div></div>')
 
 
+def trader_status_html() -> str:
+    st, detail = trader_status["state"], trader_status["detail"]
+    text = {
+        "off": "Not running in this service (KAREN_RUN_TRADER is off).",
+        "starting": "Starting…",
+        "running": f"Running here in {detail} mode.",
+        "halted": f"Stopped: {detail}",
+        "error": f"Not running: {detail}",
+    }[st]
+    cls = {"running": "ok", "off": "starting", "starting": "starting"}.get(st, "error")
+    return f'<p class="muted"><span class="pill {cls}">trader {html.escape(st)}</span> {html.escape(text)}</p>'
+
+
 def trader_html(traders: list[dict]) -> str:
     """The live trader section: one block per state file found."""
     if not traders:
-        return (f'<div class="note">No trader running here. No state file in '
-                f'<code>{html.escape(config.STATE_DIR)}</code>. Start <code>python live.py</code> '
-                f'with the same <code>KAREN_STATE_DIR</code> to see it on this page.</div>')
+        return (f'<div class="note">No trader state yet in <code>{html.escape(config.STATE_DIR)}</code>. '
+                f'Set <code>KAREN_RUN_TRADER=ON</code> and the Kraken key on this service to run it here.</div>')
     out = []
     for t in traders:
         mode = t["mode"]
@@ -220,7 +268,7 @@ def trader_html(traders: list[dict]) -> str:
             out.append(f'<h3>{badge}</h3><div class="error">State file unreadable: {html.escape(t["error"])}</div>')
             continue
         halted = (f'<div class="error"><b>HALTED.</b> {html.escape(str(t["halted"]))} '
-                  f'Check Kraken, clear <code>halted</code> in the state file, restart live.py.</div>'
+                  f'Check Kraken, clear <code>halted</code> in the state file, restart the trader.</div>'
                   if t.get("halted") else "")
         positions = t.get("positions", {})
         cards = "".join([
@@ -288,11 +336,11 @@ def page_html() -> str:
     switches = (f"Live switches: config.LIVE_TRADING={config.LIVE_TRADING}, "
                 f"KAREN_LIVE_TRADING={config.LIVE_ENV_FLAG} (as seen by this service)")
     if any(t["mode"] == "LIVE" for t in traders):
-        banner = ('<div class="banner live-banner"><b>LIVE TRADING DATA PRESENT.</b> live.py has placed '
-                  'or may place real orders on Kraken. This page only reads its state; it cannot trade.</div>')
+        banner = ('<div class="banner live-banner"><b>LIVE TRADING DATA PRESENT.</b> The trader has placed '
+                  'or may place real orders on Kraken. This page only reads its state.</div>')
     else:
-        banner = ('<div class="banner"><b>NO REAL ORDERS.</b> This page never trades. Real orders come only '
-                  'from live.py, and only when both live switches are ON.</div>')
+        banner = ('<div class="banner"><b>NO REAL ORDERS.</b> Real orders come only from the trader, '
+                  'and only when both live switches are ON. Otherwise it validates orders and places none.</div>')
 
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -376,6 +424,7 @@ def page_html() -> str:
 
 <h2 id="trader">Live trader (live.py)</h2>
 <p class="muted">Forward trading on live Kraken prices. Read from <code>{html.escape(config.STATE_DIR)}</code>.</p>
+{trader_status_html()}
 {trader_html(traders)}
 
 <h2 id="simulation">Simulation (rolling 90-day backtest)
@@ -421,6 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             with state_lock:
                 report = dict(state)
             report["trader"] = load_trader()
+            report["trader_status"] = dict(trader_status)
             body = json.dumps(report, default=str).encode()
             ctype = "application/json"
         elif self.path == "/":
@@ -443,11 +493,12 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not os.environ.get("KAREN_USER") or not os.environ.get("KAREN_PASSWORD"):
         raise SystemExit("Set KAREN_USER and KAREN_PASSWORD before starting.")
-    if config.live_trading_enabled():
-        # The dashboard never trades; live.py does.
-        print("Live switches are ON. This dashboard still places no orders; live.py does.")
     os.makedirs(DATA_DIR, exist_ok=True)
     threading.Thread(target=refresh_loop, daemon=True).start()
+    if RUN_TRADER:
+        mode = "LIVE (real orders)" if config.live_trading_enabled() else "VALIDATE (no orders placed)"
+        print(f"Starting the trader in this service, {mode}.", flush=True)
+        threading.Thread(target=trader_loop, daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
