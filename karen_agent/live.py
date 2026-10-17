@@ -80,8 +80,7 @@ class LiveTrader:
         self.clock = clock
         self.sleep = sleep
         os.makedirs(state_dir, exist_ok=True)
-        name = "positions_live.json" if live else "positions_validate.json"
-        self.state_path = os.path.join(state_dir, name)
+        self.state_path = state_path(live, state_dir)
         self.state = self._load()
         self.pairs: dict[str, dict] = {}   # coin -> AssetPairs info plus 'pair' key
 
@@ -391,19 +390,32 @@ def check(client: KrakenClient) -> bool:
     return ok
 
 
-def main() -> None:
-    client = KrakenClient()
-    if len(sys.argv) > 1 and sys.argv[1] == "check":
-        raise SystemExit(0 if check(client) else 1)
+def state_path(live: bool, state_dir: str = config.STATE_DIR) -> str:
+    return os.path.join(state_dir, "positions_live.json" if live else "positions_validate.json")
+
+
+def start_trader(client: KrakenClient) -> LiveTrader:
+    """Set up a trader in the mode the switches pick. Raises RuntimeError if it can't start."""
     if not client.has_keys():
-        raise SystemExit("Set KRAKEN_API_KEY and KRAKEN_API_SECRET first.")
+        raise RuntimeError("Set KRAKEN_API_KEY and KRAKEN_API_SECRET first.")
     live = config.live_trading_enabled()
     trader = LiveTrader(client, live=live)
     trader.load_pairs()
     if not trader.pairs:
-        raise SystemExit("No tradable pairs found.")
+        raise RuntimeError("No tradable pairs found.")
     if live:
         trader.reconcile(client.balance())
+    return trader
+
+
+def main() -> None:
+    client = KrakenClient()
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        raise SystemExit(0 if check(client) else 1)
+    try:
+        trader = start_trader(client)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
     trader.run_forever()
 
 

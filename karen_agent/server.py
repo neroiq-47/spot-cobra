@@ -1,14 +1,16 @@
-"""Karen hosted service (simulation only).
+"""Karen hosted service (dashboard; places no orders).
 
 What it does:
   - Every hour, downloads the latest Kraken public candles for the watchlist.
   - Re-runs the strategy over the last 90 days of those prices on a shared
     simulated portfolio. This is a rolling simulation, not a forward test:
     nothing is carried over between runs.
+  - Shows the live trader's saved state (live.py), read-only, if its state
+    file is in KAREN_STATE_DIR: mode, halt status, open positions and P&L.
   - Serves a password-protected HTML dashboard and JSON with the latest results.
 
 What it never does:
-  - Place real orders. This service has no live trading path.
+  - Place orders. Only live.py can trade, and only when both switches are ON.
   - Show or log the Kraken API key (it isn't needed: public prices only).
 
 Required environment variables (set in Railway, never in code):
@@ -17,6 +19,7 @@ Required environment variables (set in Railway, never in code):
 Optional:
   PORT             set automatically by Railway
   REFRESH_MINUTES  how often to refresh, default 60
+  KAREN_STATE_DIR  folder holding live.py's state files, default "state"
 """
 
 import base64
@@ -143,6 +146,29 @@ def refresh_loop() -> None:
         time.sleep(REFRESH_SECONDS)
 
 
+def load_trader() -> list[dict]:
+    """Read live.py's state files, if any. Read-only: the dashboard never trades."""
+    found = []
+    for mode, name in (("LIVE", "positions_live.json"), ("VALIDATE", "positions_validate.json")):
+        path = os.path.join(config.STATE_DIR, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                st = json.load(f)
+        except (OSError, ValueError) as e:
+            found.append({"mode": mode, "error": f"{type(e).__name__}: {e}"})
+            continue
+        found.append({"mode": mode, "updated": datetime.fromtimestamp(
+            os.path.getmtime(path), timezone.utc).isoformat(timespec="seconds"), **st})
+    return found
+
+
+def _money(v: float) -> str:
+    cls = "pos" if v >= 0 else "neg"
+    return f'<span class="{cls}">£{v:+.2f}</span>'
+
+
 def _bar_chart(per_coin: dict) -> str:
     """Inline SVG bar chart of P&L per coin. Green = profit, red = loss."""
     if not per_coin:
@@ -152,7 +178,7 @@ def _bar_chart(per_coin: dict) -> str:
     biggest = max(max(abs(v) for v in values), 1.0)
     width, row_h, label_w = 560, 34, 80
     zero_x = label_w + (width - label_w) / 2
-    half = (width - label_w) / 2 - 8
+    half = (width - label_w) / 2 - 64   # leave room for the £ label at the bar end
     height = row_h * len(items) + 10
     bars = []
     for i, (sym, v) in enumerate(items):
@@ -160,18 +186,69 @@ def _bar_chart(per_coin: dict) -> str:
         pnl = v["pnl_gbp"]
         length = abs(pnl) / biggest * half
         x = zero_x - length if pnl < 0 else zero_x
-        colour = "#2e7d32" if pnl >= 0 else "#c62828"
+        cls = "bar-pos" if pnl >= 0 else "bar-neg"
         bars.append(
             f'<text x="4" y="{y + 20}" font-size="14">{html.escape(sym)}</text>'
-            f'<rect x="{x:.1f}" y="{y + 6}" width="{max(length, 1):.1f}" height="20" fill="{colour}" rx="3"/>'
+            f'<rect class="{cls}" x="{x:.1f}" y="{y + 6}" width="{max(length, 1):.1f}" height="20" rx="3"/>'
             f'<text x="{(zero_x + length + 6) if pnl >= 0 else (zero_x - length - 6):.1f}" y="{y + 21}" '
             f'font-size="13" text-anchor="{"start" if pnl >= 0 else "end"}">£{pnl:+.2f}</text>'
         )
     return (
         f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="P&L per coin">'
-        f'<line x1="{zero_x}" y1="0" x2="{zero_x}" y2="{height}" stroke="#999"/>'
+        f'<line class="axis" x1="{zero_x}" y1="0" x2="{zero_x}" y2="{height}"/>'
         + "".join(bars) + "</svg>"
     )
+
+
+def card(label: str, value: str, sub: str = "") -> str:
+    return (f'<div class="card"><div class="label">{html.escape(label)}</div>'
+            f'<div class="value">{value}</div><div class="sub">{html.escape(sub)}</div></div>')
+
+
+def trader_html(traders: list[dict]) -> str:
+    """The live trader section: one block per state file found."""
+    if not traders:
+        return (f'<div class="note">No trader running here. No state file in '
+                f'<code>{html.escape(config.STATE_DIR)}</code>. Start <code>python live.py</code> '
+                f'with the same <code>KAREN_STATE_DIR</code> to see it on this page.</div>')
+    out = []
+    for t in traders:
+        mode = t["mode"]
+        badge = ('<span class="pill live">LIVE: real orders</span>' if mode == "LIVE"
+                 else '<span class="pill validate">VALIDATE: orders checked, none placed</span>')
+        if "error" in t:
+            out.append(f'<h3>{badge}</h3><div class="error">State file unreadable: {html.escape(t["error"])}</div>')
+            continue
+        halted = (f'<div class="error"><b>HALTED.</b> {html.escape(str(t["halted"]))} '
+                  f'Check Kraken, clear <code>halted</code> in the state file, restart live.py.</div>'
+                  if t.get("halted") else "")
+        positions = t.get("positions", {})
+        cards = "".join([
+            card("Realised P&L (total)", _money(t.get("total_pnl", 0.0)),
+                 f"stops new buys at -£{config.MAX_TOTAL_LOSS_GBP:.0f}"),
+            card("Realised P&L (today)", _money(t.get("day_pnl", 0.0)),
+                 f"{t.get('day') or 'n/a'} · limit -£{config.MAX_DAILY_LOSS_GBP:.0f}"),
+            card("Open positions", f"{len(positions)} / {config.MAX_OPEN_POSITIONS}",
+                 f"£{config.MAX_TRADE_GBP:.0f} max per buy"),
+            card("Trades logged", str(len(t.get("trades", []))), f"state saved {t['updated']}"),
+        ])
+        pos_rows = "".join(
+            f"<tr><td>{html.escape(c)}</td><td>{p['volume']:.6g}</td><td>£{p['entry']:.6g}</td>"
+            f"<td>£{p['cost']:.2f}</td><td>£{p['entry'] * 0.95:.6g}</td><td>{p['held']}h</td></tr>"
+            for c, p in sorted(positions.items())
+        ) or "<tr><td colspan=6>No open positions</td></tr>"
+        trade_rows = "".join(
+            f"<tr><td>{html.escape(str(x['time']))}</td><td>{html.escape(x['coin'])}</td>"
+            f"<td>{html.escape(x['action'])}</td><td>£{x['price']:.6g}</td><td>{_money(x['amount_gbp'])}</td></tr>"
+            for x in reversed(t.get("trades", [])[-25:])
+        ) or "<tr><td colspan=5>No trades yet</td></tr>"
+        out.append(f"""<h3>{badge}</h3>{halted}
+<div class="cards">{cards}</div>
+<h4>Open positions</h4>
+<div class="scroll"><table><tr><th>Coin</th><th>Volume</th><th>Entry</th><th>Cost</th><th>Stop (−5%)</th><th>Held</th></tr>{pos_rows}</table></div>
+<h4>Recent trades (newest first)</h4>
+<div class="scroll"><table><tr><th>Time (UTC)</th><th>Coin</th><th>Action</th><th>Price</th><th>Cash change</th></tr>{trade_rows}</table></div>""")
+    return "".join(out)
 
 
 def page_html() -> str:
@@ -180,17 +257,12 @@ def page_html() -> str:
     summ = s["summary"] or {}
     per_coin = s["per_coin"] or {}
     status = s["status"]
-    status_colour = {"ok": "#2e7d32", "error": "#c62828"}.get(status, "#757575")
-
-    def card(label: str, value: str, sub: str = "") -> str:
-        return (f'<div class="card"><div class="label">{html.escape(label)}</div>'
-                f'<div class="value">{value}</div><div class="sub">{html.escape(sub)}</div></div>')
+    traders = load_trader()
 
     ret = summ.get("return_pct")
     ret_txt = f"{ret:+.2f}%" if ret is not None else "n/a"
-    ret_colour = "#2e7d32" if (ret or 0) >= 0 else "#c62828"
     cards = "".join([
-        card("Simulated return", f'<span style="color:{ret_colour}">{ret_txt}</span>',
+        card("Simulated return", f'<span class="{"pos" if (ret or 0) >= 0 else "neg"}">{ret_txt}</span>',
              f"on £{START_CASH:,.0f} start"),
         card("Ending cash", f"£{summ.get('ending_cash_gbp', 'n/a')}"),
         card("Closed trades", str(summ.get("closed_trades", "n/a"))),
@@ -199,7 +271,7 @@ def page_html() -> str:
 
     coin_rows = "".join(
         f"<tr><td>{html.escape(sym)}</td><td>{v['trades']}</td><td>{v['win_rate_pct']}%</td>"
-        f"<td style='color:{'#2e7d32' if v['pnl_gbp'] >= 0 else '#c62828'}'>£{v['pnl_gbp']:+.2f}</td></tr>"
+        f"<td>{_money(v['pnl_gbp'])}</td></tr>"
         for sym, v in sorted(per_coin.items())
     ) or "<tr><td colspan=4>No closed trades yet</td></tr>"
 
@@ -212,45 +284,113 @@ def page_html() -> str:
     error_html = (f'<div class="error">Last refresh failed: {html.escape(str(s["error"]))}</div>'
                   if s["error"] else "")
 
+    live_on = config.live_trading_enabled()
+    switches = (f"Live switches: config.LIVE_TRADING={config.LIVE_TRADING}, "
+                f"KAREN_LIVE_TRADING={config.LIVE_ENV_FLAG} (as seen by this service)")
+    if any(t["mode"] == "LIVE" for t in traders):
+        banner = ('<div class="banner live-banner"><b>LIVE TRADING DATA PRESENT.</b> live.py has placed '
+                  'or may place real orders on Kraken. This page only reads its state; it cannot trade.</div>')
+    else:
+        banner = ('<div class="banner"><b>NO REAL ORDERS.</b> This page never trades. Real orders come only '
+                  'from live.py, and only when both live switches are ON.</div>')
+
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="300">
 <title>Karen dashboard</title>
 <style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font-family: system-ui, sans-serif; margin: 0; padding: 16px; max-width: 760px; margin-inline: auto; }}
-  h1 {{ font-size: 22px; margin: 0 0 4px; }}
-  h2 {{ font-size: 16px; margin: 24px 0 8px; }}
-  .muted {{ color: #757575; font-size: 13px; }}
-  .banner {{ background: #fff3cd; color: #5d4500; padding: 10px; border-radius: 8px; font-size: 14px; }}
-  .error {{ background: #fdecea; color: #611a15; padding: 10px; border-radius: 8px; font-size: 14px; margin-top: 8px; }}
-  .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; color: #fff; font-size: 12px; }}
-  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }}
-  .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 12px; }}
-  .label {{ font-size: 12px; color: #757575; }}
+  :root {{
+    color-scheme: light;
+    --bg: #f6f2fc; --surface: #ffffff; --ink: #24133d; --muted: #6e5d86;
+    --line: #e2d8f1; --accent: #6a35b8; --header: #5b2ca6; --accent-soft: #ede4fa;
+    --btn: #cfe8ff; --btn-hover: #b5dbff; --btn-ink: #0d3557; --btn-line: #9ccbf5;
+    --pos: #1f7a3a; --neg: #b3261e;
+    --warn-bg: #efe6fb; --warn-ink: #3d1f6b; --err-bg: #fdecea; --err-ink: #611a15;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme="light"]) {{
+      color-scheme: dark;
+      --bg: #170f24; --surface: #21173a; --ink: #eee6fb; --muted: #b3a3cc;
+      --line: #3a2b57; --accent: #b896f0; --header: #3b2170; --accent-soft: #2e2150;
+      --btn: #a9d4fb; --btn-hover: #c4e2ff; --btn-ink: #082a47; --btn-line: #7fb9ec;
+      --pos: #6fd18f; --neg: #ff8a80;
+      --warn-bg: #2e2150; --warn-ink: #e3d4fb; --err-bg: #4a1d1a; --err-ink: #ffd8d3;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--ink); }}
+  .wrap {{ padding: 16px; max-width: 820px; margin-inline: auto; }}
+  header {{ background: var(--header); color: #fff; }}
+  header .wrap {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }}
+  h1 {{ font-size: 22px; margin: 0; }}
+  h2 {{ font-size: 18px; margin: 28px 0 4px; color: var(--accent); }}
+  h3 {{ font-size: 15px; margin: 14px 0 6px; }}
+  h4 {{ font-size: 14px; margin: 18px 0 6px; }}
+  .muted {{ color: var(--muted); font-size: 13px; }}
+  header .muted {{ color: #e6dbf7; }}
+  .actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; }}
+  .btn {{ display: inline-block; background: var(--btn); color: var(--btn-ink); border: 1px solid var(--btn-line);
+          padding: 7px 14px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; cursor: pointer; }}
+  .btn:hover {{ background: var(--btn-hover); }}
+  .btn:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+  .banner {{ background: var(--warn-bg); color: var(--warn-ink); border-left: 4px solid var(--accent);
+             padding: 10px 12px; border-radius: 8px; font-size: 14px; margin-top: 12px; }}
+  .live-banner {{ border-left-color: var(--neg); }}
+  .note {{ background: var(--surface); border: 1px dashed var(--line); padding: 10px 12px; border-radius: 8px; font-size: 14px; }}
+  .error {{ background: var(--err-bg); color: var(--err-ink); padding: 10px; border-radius: 8px; font-size: 14px; margin-top: 8px; }}
+  .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }}
+  .pill.ok {{ background: #d7f5df; color: #14532d; }}
+  .pill.error {{ background: #fdecea; color: #611a15; }}
+  .pill.starting {{ background: #ede4fa; color: #3d1f6b; }}
+  .pill.validate {{ background: var(--accent-soft); color: var(--accent); }}
+  .pill.live {{ background: var(--neg); color: #fff; }}
+  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }}
+  .card {{ background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }}
+  .label {{ font-size: 12px; color: var(--muted); }}
   .value {{ font-size: 22px; font-weight: 600; margin-top: 4px; }}
-  .sub {{ font-size: 12px; color: #757575; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
-  td, th {{ border-bottom: 1px solid #ddd; padding: 6px; text-align: left; }}
-  th {{ font-size: 12px; color: #757575; font-weight: 500; }}
-  .chart {{ border: 1px solid #ddd; border-radius: 10px; padding: 10px; }}
+  .sub {{ font-size: 12px; color: var(--muted); }}
+  .pos {{ color: var(--pos); }} .neg {{ color: var(--neg); }}
+  .scroll {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); border-radius: 10px; }}
+  td, th {{ border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; white-space: nowrap; }}
+  th {{ font-size: 12px; color: var(--muted); font-weight: 500; }}
+  .chart {{ background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }}
+  .chart text {{ fill: var(--ink); }}
+  .axis {{ stroke: var(--muted); }}
+  .bar-pos {{ fill: var(--pos); }} .bar-neg {{ fill: var(--neg); }}
+  code {{ background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }}
 </style></head><body>
-<h1>Karen agent</h1>
-<div class="muted">
-  <span class="pill" style="background:{status_colour}">{html.escape(str(status))}</span>
-  Last updated: {html.escape(str(s['updated'] or 'never'))} (UTC) · Auto-refreshes every 5 min
+<header><div class="wrap">
+  <h1>Karen agent</h1>
+  <span class="muted">Updated {html.escape(str(s['updated'] or 'never'))} UTC · auto-refresh 5 min</span>
+</div></header>
+<main class="wrap">
+<div class="actions">
+  <a class="btn" href="/">Refresh</a>
+  <a class="btn" href="#trader">Live trader</a>
+  <a class="btn" href="#simulation">Simulation</a>
+  <a class="btn" href="/api/report">JSON report</a>
 </div>
-<div class="banner"><b>SIMULATION ONLY.</b> Re-runs the strategy on the last 90 days of prices every hour.
-No orders are placed, and nothing carries over between runs.</div>
+{banner}
+<p class="muted">{html.escape(switches)}{' · LIVE mode' if live_on else ' · validate mode'}</p>
+
+<h2 id="trader">Live trader (live.py)</h2>
+<p class="muted">Forward trading on live Kraken prices. Read from <code>{html.escape(config.STATE_DIR)}</code>.</p>
+{trader_html(traders)}
+
+<h2 id="simulation">Simulation (rolling 90-day backtest)
+  <span class="pill {html.escape(str(status))}">{html.escape(str(status))}</span></h2>
+<p class="muted">Re-runs the strategy on the last 90 days of prices every hour. Nothing carries over between runs.</p>
 {error_html}
 <div class="cards">{cards}</div>
-<h2>Profit or loss by coin</h2>
+<h4>Profit or loss by coin</h4>
 <div class="chart">{_bar_chart(per_coin)}</div>
-<h2>Per coin</h2>
-<table><tr><th>Coin</th><th>Closed trades</th><th>Win rate</th><th>P&amp;L</th></tr>{coin_rows}</table>
-<h2>Recent trades (newest first)</h2>
-<table><tr><th>Time (UTC)</th><th>Action</th><th>Price</th><th>Cash change (£)</th></tr>{trade_rows}</table>
+<h4>Per coin</h4>
+<div class="scroll"><table><tr><th>Coin</th><th>Closed trades</th><th>Win rate</th><th>P&amp;L</th></tr>{coin_rows}</table></div>
+<h4>Recent simulated trades (newest first)</h4>
+<div class="scroll"><table><tr><th>Time (UTC)</th><th>Action</th><th>Price</th><th>Cash change (£)</th></tr>{trade_rows}</table></div>
 <p class="muted">Coins: {html.escape(', '.join(summ.get('coins', [])) or 'n/a')} · Costs assumed: fees {config.FEE*100:.2f}% per side, slippage {config.SLIPPAGE*100:.2f}%</p>
+</main>
 </body></html>"""
 
 
@@ -279,7 +419,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny()
         if self.path == "/api/report":
             with state_lock:
-                body = json.dumps(state, default=str).encode()
+                report = dict(state)
+            report["trader"] = load_trader()
+            body = json.dumps(report, default=str).encode()
             ctype = "application/json"
         elif self.path == "/":
             body = page_html().encode()
@@ -302,8 +444,8 @@ def main() -> None:
     if not os.environ.get("KAREN_USER") or not os.environ.get("KAREN_PASSWORD"):
         raise SystemExit("Set KAREN_USER and KAREN_PASSWORD before starting.")
     if config.live_trading_enabled():
-        # The hosted service is paper-only by design.
-        print("Live switch is ON in config, but the hosted service ignores it.")
+        # The dashboard never trades; live.py does.
+        print("Live switches are ON. This dashboard still places no orders; live.py does.")
     os.makedirs(DATA_DIR, exist_ok=True)
     threading.Thread(target=refresh_loop, daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))

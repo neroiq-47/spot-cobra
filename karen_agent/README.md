@@ -10,7 +10,7 @@ real orders can only come from `live.py`, and only when both switches are ON.
 - `config.py`: watchlist, limits, fees, and the live switch (OFF by default).
 - `fetch_kraken.py`: downloads public hourly candles from Kraken. No login, no API key.
 - `feed.py`: price source interface. The live connector is not connected.
-- `server.py`: hosted, login-protected paper-trading page for Railway.
+- `server.py`: hosted, login-protected dashboard for Railway. Shows the rolling simulation and, read-only, the live trader's saved state from `KAREN_STATE_DIR`. It never places orders.
 - `kraken_client.py`: signed Kraken private API (balance, market orders, order status).
 - `live.py`: the live trader. Validate mode (default) or real orders.
 - `test_live.py`: offline tests for the live path (`python -m unittest test_live`).
